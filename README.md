@@ -1,154 +1,124 @@
-# Quantitative Momentum Strategy Backtesting (In Progress)
+# Quantitative Momentum Strategy — Walk-Forward Backtesting
 
-## Status
-
-This project is currently under active development. Core functionality is implemented, but the framework is still being improved and extended. Results should not be considered final or production-ready.
+**Status:** active development — results not production-ready ()
 
 ---
 
-## Project Overview
+## Objective
 
-This project implements a systematic long/short equity strategy based on cross-sectional momentum, together with a modular backtesting framework.
+Market-neutral long/short equity strategy on cross-sectional momentum.
+Walk-forward backtesting framework with signal evaluation, parameter selection, and statistical significance.
 
-The main objectives are:
-
-* to build a clean and extensible research pipeline
-* to evaluate strategy robustness using walk-forward testing
-* to compare performance against a benchmark 
-* to assess whether the signal and portfolio construction provide meaningful value
 ---
 
-## Strategies Description
+## Signals
 
-The current 2 compared strategies are cross-sectional momentum strategies:
-1. Equal-weight Strategy
-   1. A momentum signal is computed based on past price performance over a given lookback window 
+Three signals, all skip-1-month to avoid microstructure reversal:
 
-   2. Assets are ranked according to the signal
+| Signal | Formula at time t |
+|---|---|
+| Raw Momentum | `P(t-1)/P(t-L) - 1` |
+| Risk-Adj Momentum | `μ_L(t) / σ_ann(t-1)` — vol computed through t-1 only, no look-ahead |
+| Composite | `[z(μ_L) + z(μ_L/σ)] / 2` — cross-sectional z-score before blending |
 
-   3. Portfolio construction:
+---
 
-      * top quantile is taken long
-      * bottom quantile is taken short
-      * everything in between stays neutral
-      * positions are equal-weighted within each side
-      * the portfolio is market-neutral (long equals short; exposures are 1 and -1; net = 0, abs = 2)
+## Portfolio Construction
 
-   4. The portfolio is rebalanced on a monthly basis (ME)
+Signal-weighted, market-neutral long/short:
 
-2. Signal-based-weight Strategy
-   1. A momentum signal is computed based on past price performance over a given lookback window 
-
-   2. Assets are ranked according to the signal
-
-   3. Portfolio construction:
-
-      * top quantile assets are taken as long candidates
-      * bottom quantile assets are taken as short candidates
-      * everything in between stays neutral
-      * positions are weighted based on their normalized signal (signal / sum(signals) in this quantile)
-      * the portfolio is market-neutral (long equals short; exposures are 1 and -1; net = 0, abs = 2)
-
-   4. The portfolio is rebalanced on a monthly basis (ME)
+- Top-q quantile → long candidates; bottom-q → short candidates
+- `w_i = s_i / Σs_j` within each side (signal-proportional weights)
+- Fallback to equal-weight if all candidate signals have wrong sign
+- `net = 0`, `gross = 2`; rebalanced monthly
 
 ---
 
 ## Walk-Forward Backtesting
 
-Instead of a single train/test split, the project uses a rolling (walk-forward) validation approach:
+No look-ahead bias, no reuse of test data:
 
-* train on a fixed window (right now 36 months)
-* select the best parameters (lookback and quantile) on the training window (Grid is adjustable)
-* test on the subsequent period (right now 6 months)
-* repeat this process through time (Training on months 0-35, Test on months 36-41; Training on months 6-41; Test on months 42-47)
-
-This ensures:
-
-* no look-ahead bias
-* no reuse of test data
-* a more realistic out-of-sample evaluation
+- Train on fixed 36-month window → grid search `(lookback ∈ {3,6,9,12}, q ∈ {0.1,...,0.5})`
+- Select `(L*, q*)` maximising in-sample Sharpe
+- Test on next 6 months OOS using `(L*, q*)`
+- Roll forward by 6 months, repeat
 
 ---
 
-## Performance Evaluation
+## Signal Quality: IC / ICIR
 
-The following metrics are computed:
+Evaluated before backtesting on full sample (no params fitted → no look-ahead):
 
-* annualized return (mean monthly return multiplied by 12)
-* annualized volatility
-* Sharpe ratio
-* maximum drawdown
-* turnover (based on changes in portfolio weights)
+- `IC(t) = rank_corr(signal_t, r_{t→t+1})` — Spearman, cross-sectional
+- `ICIR = mean(IC) / std(IC)` — Sharpe of the signal
+- IC decay at `h = 1..6m` uses `P(t+h)/P(t)-1` (cumulative, not individual period returns)
 
-Returns are calculated using lagged weights to avoid look-ahead bias. Transaction costs are incorporated based on portfolio turnover.
+Thresholds: `|mean IC| > 0.05` useful; `ICIR > 0.5` production-grade
 
 ---
 
-## Benchmarks
+## Performance Metrics
 
-Random long/short portfolios are used as a baselines:
+| Metric | Definition |
+|---|---|
+| Sharpe | `ann_ret / ann_vol` (rf = 0, justified for market-neutral) |
+| Sortino | `ann_ret / downside_std` — upside vol not penalised |
+| Calmar | `ann_ret / |max_DD|` |
+| Hit rate | `P(r_t > 0)` |
+| t-statistic | `H₀: E[r]=0`; `|t|>2 ≈ p<0.05` for n>30 |
+| Max drawdown | `min_t { NAV(t) / max_{s≤t} NAV(s) - 1 }` |
 
-1. BM for equal-weight Strategy
-  * fill top and bottom quantile with random assets
-  * weight them equally (+/- 1 / quantile size)
-  * this approach appears to be quiet weak due to complete randomness
-  * ensures same net- & abs- exposure as strategy
+---
 
+## Benchmark
 
-2. BM for signal-based-weight Strategy
-  * use top and bottom quantiles as candidates
-  * weight them equally randomly 
-  * this approach is already quit strong in theory as we only consider best/worst assets based on signal as longs/shorts
-  * ensures same net- & abs- exposure as strategy
+Random long/short with identical gross/net exposure:
+
+- Select `n_long + n_short` assets uniformly from full universe (no signal conditioning)
+- Weights drawn from Dirichlet(1) ≡ uniform on simplex per side
+- Reuses same `(L*, q*)` as strategy → isolates weighting skill from param selection
 
 ---
 
 ## Project Structure
 
-```text
+```
 src/
-├── data_loader.py
-├── signals.py
-├── portfolio.py
-├── backtest.py
-├── metrics.py
-├── random_portfolio.py
+├── data_loader.py       — yfinance download, monthly resample
+├── signals.py           — momentum_signal, risk_adjusted_momentum, composite_signal
+├── ic_analysis.py       — compute_ic, compute_icir, ic_summary, compute_ic_decay
+├── portfolio.py         — equal-weight and signal-weighted construction
+├── backtest.py          — lagged-weight return computation, transaction costs
+├── metrics.py           — Sharpe, Sortino, Calmar, hit_rate, t_statistic, drawdown
+└── random_portfolio.py  — random benchmarks
 
-main.py
+main.py                  — data load → IC analysis → walk-forward → plots
 ```
 
 ---
 
-## Current Limitations
+## Known Limitations
 
-* single signal
-* simplified transaction cost model 
-* weak benchmark (Its tough to not outperform the first BM)
-* no statistical significance testing
-
----
-
-## Planned Improvements
-
-* clean main
-* improved transaction cost modeling
-* stronger benchmarks 
-* additional signals
-* improved reporting and visualization
-* reproducibility of the benchmark via fixed random seeds
+- Signal is extremely weak. In returns and also IC, mainly due to vola weighting
+- Transaction cost model: flat 10bps per unit turnover (no market impact, no bid-ask)
+- Benchmark picks from full universe — not conditioned on signal top/bottom quantile
+- Universe: ~90 US large-cap stocks — survivorship bias (all currently in S&P 500)
+- Signal-weighted momentum is sensitive to momentum crashes (2020, 2022): concentrates in the exact stocks that reverse hardest in reversal episodes
 
 ---
 
-## How to Run
+## Planned
 
-1. Install dependencies:
+- Improve the signal
+- Volatility-scaled position sizing — reduces crash exposure
+- Walk-forward IC analysis — detect signal decay across time
+- Stronger benchmark: random selection restricted to top/bottom quantile
 
-   ```
-   pip install pandas numpy yfinance matplotlib
-   ```
+---
 
-2. Run the main script:
+## Setup
 
-   ```
-   python main.py
-   ```
+```bash
+pip install pandas numpy scipy yfinance matplotlib
+python main.py
+```
