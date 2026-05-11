@@ -175,6 +175,7 @@ Random long/short portfolio with identical gross and net exposure:
 
 ## Planned Improvements
 
+- Implement r_a_momentum
 - Improve signal design.
 - Add volatility-scaled position sizing.
 - Add walk-forward IC analysis to detect signal decay over time.
