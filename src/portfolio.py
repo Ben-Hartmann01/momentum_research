@@ -8,12 +8,13 @@ def get_weights(signal_row, long_quantile, short_quantile, target_net_exposure=0
         return pd.Series(dtype=float)
 
     n_long, n_short = max(1, int(n * long_quantile)), max(1, int(n * short_quantile))
-    ranked          = signal_row.sort_values()
-    short_stocks    = ranked.index[:n_short]
-    long_stocks     = ranked.index[-n_long:]
+    ranked       = signal_row.sort_values()
+    short_stocks = ranked.index[:n_short]
+    long_stocks  = ranked.index[-n_long:]
 
     weights = pd.Series(0.0, index=signal_row.index)
 
+    # gross = long + short, net = long - short → solve: long = (gross+net)/2
     long_target  = (target_gross_exposure + target_net_exposure) / 2
     short_target = (target_gross_exposure - target_net_exposure) / 2
 
@@ -25,8 +26,8 @@ def get_weights(signal_row, long_quantile, short_quantile, target_net_exposure=0
     return weights
 
 
-# signal-prop L/S:  w_i = s_i / Σs_j  per side
-# clip(0): top-q stock with s<0 → equal-wt fallback, never flip direction
+# signal-prop within each side: w_i ∝ s_i
+# clip(0): top-q stock with negative signal → equal-weight fallback, don't flip direction
 def get_weights_signal_weighted(signal_row, long_quantile, short_quantile, target_net_exposure=0.0, target_gross_exposure=2.0):
     signal_row = signal_row.dropna()
     n = len(signal_row)
@@ -34,9 +35,9 @@ def get_weights_signal_weighted(signal_row, long_quantile, short_quantile, targe
         return pd.Series(dtype=float)
 
     n_long, n_short = max(1, int(n * long_quantile)), max(1, int(n * short_quantile))
-    ranked          = signal_row.sort_values()
-    short_stocks    = ranked.index[:n_short]
-    long_stocks     = ranked.index[-n_long:]
+    ranked       = signal_row.sort_values()
+    short_stocks = ranked.index[:n_short]
+    long_stocks  = ranked.index[-n_long:]
 
     weights = pd.Series(0.0, index=signal_row.index)
 
@@ -46,7 +47,7 @@ def get_weights_signal_weighted(signal_row, long_quantile, short_quantile, targe
     long_target  = (target_gross_exposure + target_net_exposure) / 2
     short_target = (target_gross_exposure - target_net_exposure) / 2
 
-    if long_signals.sum() <= 0:
+    if long_signals.sum() <= 0:   # all wrong sign — fall back
         weights.loc[long_stocks] = long_target / n_long
     else:
         weights.loc[long_stocks] = long_target * (long_signals / long_signals.sum())

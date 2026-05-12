@@ -2,8 +2,8 @@ import pandas as pd
 import numpy as np
 
 
-# IC(t) := rank_corr(s_t, r_{t+1})  Spearman, cross-sectional
-# |mean IC| > 0.05 → live signal
+# IC(t) = spearman rank corr of signal vs next-period returns, cross-sec
+# |mean IC| > 0.05 rough threshold to call it a live signal
 def compute_ic(signal_df, forward_returns):
     common_dates = signal_df.index.intersection(forward_returns.index)
     ic_values    = {}
@@ -13,7 +13,7 @@ def compute_ic(signal_df, forward_returns):
         ret    = forward_returns.loc[date].dropna()
         common = sig.index.intersection(ret.index)
 
-        if len(common) < 5:   # rank corr breaks down at small n
+        if len(common) < 5:  # rank corr breaks at tiny n
             ic_values[date] = np.nan
             continue
 
@@ -22,8 +22,8 @@ def compute_ic(signal_df, forward_returns):
     return pd.Series(ic_values)
 
 
-# ICIR := mean(IC) / std(IC)  — Sharpe of the signal
-# > 0.5 → production-grade consistency
+# signal Sharpe — mean IC / std(IC)
+# > 0.5 is considered production-grade consistency
 def compute_icir(ic_series):
     ic = ic_series.dropna()
     return ic.mean() / ic.std() if ic.std() != 0 else np.nan
@@ -40,14 +40,14 @@ def ic_summary(ic_series, signal_name="Signal"):
     return {"mean_ic": ic.mean(), "ic_std": ic.std(), "icir": icir}
 
 
-# decay at h: IC(s_t, P(t+h)/P(t)−1)  — cumulative, not period
-# period IC at h is noise: no reason s_t predicts r_{t+h} in isolation
+# cumulative return at each horizon — not period-by-period, avoids compounding noise
+# how long does the signal stay predictive after formation?
 def compute_ic_decay(prices, signal_func, max_horizon=6, lookback=12):
     signals = signal_func(prices, lookback)
     decay   = {}
 
     for h in range(1, max_horizon + 1):
-        fwd      = prices.shift(-h) / prices - 1   # P(t+h)/P(t) − 1
+        fwd      = prices.shift(-h) / prices - 1  # P(t+h)/P(t) - 1
         decay[h] = compute_ic(signals, fwd).dropna().mean()
 
     return pd.Series(decay)

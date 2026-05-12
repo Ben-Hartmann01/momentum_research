@@ -14,19 +14,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-# ── Universe ───────────────────────────────────────────────────────────────────
-
-def compute_signal(prices, signal_type, lookback):
-    if signal_type == "momentum":
-        return momentum_signal(prices, lookback=lookback)
-    elif signal_type == "mean_reversion":
-        return mean_reversion_signal(prices, lookback=lookback)
-    elif signal_type == "composite":
-        return composite_signal(prices, momentum_lookback=lookback)
-    else:
-        raise ValueError(f"Unknown signal_type: {signal_type}")
-
-# Data
+# ── Data params ────────────────────────────────────────────────────────────────
 
 tickers = [
     "AAPL", "MSFT", "AMZN", "META", "NVDA", "GOOGL", "GOOG", "TSLA",
@@ -43,19 +31,42 @@ tickers = [
 
 start_date            = "2014-01-01"
 end_date              = "2026-04-10"
-lookbacks             = [3, 6, 9, 12]
+lookbacks             = [3, 6, 9, 12]        # months
 quantiles             = [0.1, 0.2, 0.3, 0.4, 0.5]
-net_exposures         = [0.0, 0.5, 1.0]
 target_gross_exposure = 2
-train_window          = 36
-test_window           = 6
+train_window          = 36   # months for in-sample param selection
+test_window           = 6    # months OOS per fold
 
-# single source of truth — IC analysis & walk-forward iterate the same list
-SIGNALS = [
-    ("Raw Momentum",      momentum_signal),
-    ("Risk-Adj Momentum", risk_adjusted_momentum),
-    ("Composite Signal",  composite_signal),
+
+# ── Central registries ─────────────────────────────────────────────────────────
+
+# SIGNAL_REGISTRY: drives IC analysis — add a signal here to include it in IC output
+# mean reversion pinned to 1m lookback regardless of the lb argument passed externally
+SIGNAL_REGISTRY = {
+    "Momentum":       momentum_signal,
+    "Risk-Adj Mom":   risk_adjusted_momentum,
+    "Mean Reversion": lambda p, lb: mean_reversion_signal(p, lookback=1),
+    "Composite":      composite_signal,
+}
+
+# PORTFOLIO_CONFIGS: single source of truth for walk-forward, metrics table, and plots
+# add/remove rows here to change what gets evaluated — nothing else needs touching
+PORTFOLIO_CONFIGS = [
+    {"name": "Momentum | equal | L/S",             "signal": "Momentum",  "method": "equal",  "net": 0.0},
+    {"name": "Momentum | signal-wt | L/S",          "signal": "Momentum",  "method": "signal", "net": 0.0},
+    {"name": "Momentum | equal | half-L/S",         "signal": "Momentum",  "method": "equal",  "net": 0.5},
+    {"name": "Momentum | signal-wt | half-L/S",     "signal": "Momentum",  "method": "signal", "net": 0.5},
+    {"name": "Momentum | equal | long-only",        "signal": "Momentum",  "method": "equal",  "net": 1.0},
+    {"name": "Momentum | signal-wt | long-only",    "signal": "Momentum",  "method": "signal", "net": 1.0},
+    {"name": "Composite | equal | L/S",             "signal": "Composite", "method": "equal",  "net": 0.0},
+    {"name": "Composite | signal-wt | L/S",         "signal": "Composite", "method": "signal", "net": 0.0},
+    {"name": "Composite | equal | half-L/S",        "signal": "Composite", "method": "equal",  "net": 0.5},
+    {"name": "Composite | signal-wt | half-L/S",    "signal": "Composite", "method": "signal", "net": 0.5},
+    {"name": "Composite | equal | long-only",       "signal": "Composite", "method": "equal",  "net": 1.0},
+    {"name": "Composite | signal-wt | long-only",   "signal": "Composite", "method": "signal", "net": 1.0},
 ]
+
+BENCHMARK_NAME = "Benchmark (EW L/O)"
 
 
 # ── Weight functions ───────────────────────────────────────────────────────────
@@ -63,30 +74,36 @@ SIGNALS = [
 _WEIGHT_FUNCTIONS = {
     "equal":         compute_weights,
     "signal":        compute_weights_signal_weighted,
-    "random_equal":  compute_random_weights,
+    "random_equal":  compute_random_weights,    # available but not in default configs
     "random_signal": compute_random_weights_signal_based,
 }
 
 def get_weight_function(method: str):
     if method not in _WEIGHT_FUNCTIONS:
-        raise ValueError(f"Unknown method: {method}")
+        raise ValueError(f"Unknown method: {method!r}")
     return _WEIGHT_FUNCTIONS[method]
 
 
+def compute_signal(prices, signal_key: str, lookback: int):
+    if signal_key not in SIGNAL_REGISTRY:
+        raise ValueError(f"Unknown signal: {signal_key!r}")
+    return SIGNAL_REGISTRY[signal_key](prices, lookback)
+
+
 # ── Param selection ────────────────────────────────────────────────────────────
-# grid over (L, q): pick max in-sample Sharpe — normalises across vol regimes
+
+# grid over (lookback, quantile) — pick combo with max in-sample Sharpe
+# Sharpe normalizes across vol regimes better than raw return
 def select_best_params(train_prices, train_returns, lookbacks, quantiles,
-                       method="equal", signal_type="momentum",
+                       method="equal", signal_key="Momentum",
                        target_net_exposure=0.0, target_gross_exposure=2.0):
     best_sharpe = None
     best_params = None
-
-    weight_func = get_weight_function(method=method)
+    weight_func = get_weight_function(method)
 
     for lb in lookbacks:
         for q in quantiles:
-            signals = compute_signal(train_prices, signal_type=signal_type, lookback=lb)
-
+            signals = compute_signal(train_prices, signal_key, lb)
             weights = weight_func(
                 signals,
                 long_quantile=q,
@@ -94,12 +111,9 @@ def select_best_params(train_prices, train_returns, lookbacks, quantiles,
                 target_net_exposure=target_net_exposure,
                 target_gross_exposure=target_gross_exposure,
             )
-
             rets = compute_returns(weights, train_returns)
             rets_net, _ = apply_transaction_costs(weights, rets)
-
             _, _, sharpe = performance_metrics(rets_net.dropna())
-
             if best_sharpe is None or sharpe > best_sharpe:
                 best_sharpe = sharpe
                 best_params = {"lookback": lb, "quantile": q}
@@ -108,16 +122,17 @@ def select_best_params(train_prices, train_returns, lookbacks, quantiles,
 
 
 # ── Single OOS block ───────────────────────────────────────────────────────────
-# signal on full [0:test_end]: rolling windows need history before test period
-# eval on [test_start:test_end] only → no bleed from future prices
+
+# signal computed on [0, test_end] so rolling lookbacks have full warmup history
+# only the [test_start, test_end] slice is actually used for evaluation
 def run_test_block(prices, returns, test_start, test_end, lookback, quantile,
-                   method="equal", signal_type="momentum",
+                   method="equal", signal_key="Momentum",
                    target_net_exposure=0.0, target_gross_exposure=2.0):
     block_prices  = prices.iloc[:test_end].copy()
     block_returns = returns.iloc[:test_end].copy()
 
-    signals     = compute_signal(block_prices, signal_type=signal_type, lookback=lookback)
-    weight_func = get_weight_function(method=method)
+    signals     = compute_signal(block_prices, signal_key, lookback)
+    weight_func = get_weight_function(method)
 
     weights = weight_func(
         signals,
@@ -127,40 +142,40 @@ def run_test_block(prices, returns, test_start, test_end, lookback, quantile,
         target_gross_exposure=target_gross_exposure,
     )
 
-    test_weights  = weights.iloc[test_start:test_end].copy()
-    test_returns  = block_returns.iloc[test_start:test_end].copy()
-
-    net_rets, turnover = apply_transaction_costs(test_weights, compute_returns(test_weights, test_returns))
+    test_weights = weights.iloc[test_start:test_end].copy()
+    test_returns = block_returns.iloc[test_start:test_end].copy()
+    net_rets, turnover = apply_transaction_costs(
+        test_weights, compute_returns(test_weights, test_returns)
+    )
     return test_weights, net_rets, turnover
 
 
-# ── Equal-weight benchmark block ───────────────────────────────────────────────
+# ── Benchmark block ────────────────────────────────────────────────────────────
 
-# New BM
 def run_equal_weight_benchmark_block(prices, returns, test_start, test_end):
     block_prices  = prices.iloc[:test_end].copy()
     block_returns = returns.iloc[:test_end].copy()
 
-    benchmark_signals = block_prices.notna().astype(float)
-    benchmark_weights = compute_equal_weight_long_only_weights(benchmark_signals)
+    # notna mask as signal — every live asset gets equal weight
+    bm_signals = block_prices.notna().astype(float)
+    bm_weights = compute_equal_weight_long_only_weights(bm_signals)
 
-    test_weights  = benchmark_weights.iloc[test_start:test_end].copy()
-    test_returns  = block_returns.iloc[test_start:test_end].copy()
+    test_weights = bm_weights.iloc[test_start:test_end].copy()
+    test_returns = block_returns.iloc[test_start:test_end].copy()
 
-    benchmark_returns = compute_returns(test_weights, test_returns)
-    benchmark_returns_net, turnover = apply_transaction_costs(test_weights, benchmark_returns)
-
-    return test_weights, benchmark_returns_net, turnover
+    bm_returns, turnover = apply_transaction_costs(
+        test_weights, compute_returns(test_weights, test_returns)
+    )
+    return test_weights, bm_returns, turnover
 
 
 # ── Summary ────────────────────────────────────────────────────────────────────
 
-def summarize_results(returns_series: pd.Series):
-    cum   = (1 + returns_series.fillna(0)).cumprod()
+def summarize_results(returns_series: pd.Series) -> dict:
+    cum   = (1 + returns_series.fillna(0)).cumprod()  # compounding NAV
     clean = returns_series.dropna()
     ann_ret, ann_vol, sharpe = performance_metrics(clean)
     dd, max_dd = drawdown(cum)
-
     return {
         "returns":    returns_series,
         "cumulative": cum,
@@ -176,30 +191,14 @@ def summarize_results(returns_series: pd.Series):
     }
 
 
-def print_summary(title, summary):
-    t, p = summary["t_stat"]
-    print(f"\n{title}")
-    print(f"  ann ret  : {summary['ann_ret']:.4f}")
-    print(f"  ann vol  : {summary['ann_vol']:.4f}")
-    print(f"  Sharpe   : {summary['sharpe']:.4f}")
-    print(f"  Sortino  : {summary['sortino']:.4f}")
-    print(f"  Calmar   : {summary['calmar']:.4f}")
-    print(f"  hit rate : {summary['hit_rate']*100:.1f}%")
-    print(f"  max DD   : {summary['max_dd']:.4f}")
-    print(f"  t-stat   : {t:.2f}  (p={p:.3f})")
+# ── Walk-forward (strategy) ────────────────────────────────────────────────────
 
-
-# ── Walk-forward ───────────────────────────────────────────────────────────────
-# train [t-36,t) → (L*,q*) → test [t,t+6) → roll +6
-# same (L*,q*) for strat & BM: isolates weighting skill from param luck
+# train [t-36, t) → select (lb*, q*) → test [t, t+6) → shift +6, repeat
 def run_walk_forward(prices, returns, lookbacks, quantiles, train_window, test_window,
-                     method="equal", signal_type="momentum",
+                     method="equal", signal_key="Momentum",
                      target_net_exposure=0.0, target_gross_exposure=2.0):
-
-    all_strategy_returns    = []
-    all_benchmark_returns   = []
-    selected_params_history = []
-
+    all_returns     = []
+    selected_params = []
     n = len(prices)
 
     for test_start in range(train_window, n - test_window + 1, test_window):
@@ -214,133 +213,145 @@ def run_walk_forward(prices, returns, lookbacks, quantiles, train_window, test_w
             lookbacks=lookbacks,
             quantiles=quantiles,
             method=method,
-            signal_type=signal_type,
+            signal_key=signal_key,
             target_net_exposure=target_net_exposure,
             target_gross_exposure=target_gross_exposure,
         )
 
-        best_lb = best_params["lookback"]
-        best_q  = best_params["quantile"]
-
-        _, strategy_returns_net, _ = run_test_block(
+        _, rets_net, _ = run_test_block(
             prices=prices,
             returns=returns,
             test_start=test_start,
             test_end=test_end,
-            lookback=best_lb,
-            quantile=best_q,
+            lookback=best_params["lookback"],
+            quantile=best_params["quantile"],
             method=method,
-            signal_type=signal_type,
+            signal_key=signal_key,
             target_net_exposure=target_net_exposure,
             target_gross_exposure=target_gross_exposure,
         )
 
-        _, benchmark_returns_net, _ = run_equal_weight_benchmark_block(
-            prices=prices,
-            returns=returns,
-            test_start=test_start,
-            test_end=test_end,
-        )
-
-        all_strategy_returns.append(strategy_returns_net)
-        all_benchmark_returns.append(benchmark_returns_net)
-        selected_params_history.append({
+        all_returns.append(rets_net)
+        selected_params.append({
             "test_start":   prices.index[test_start],
             "test_end":     prices.index[test_end - 1],
-            "lookback":     best_lb,
-            "quantile":     best_q,
+            "lookback":     best_params["lookback"],
+            "quantile":     best_params["quantile"],
             "train_sharpe": best_sharpe,
         })
 
     return {
-        "strategy":  summarize_results(pd.concat(all_strategy_returns).sort_index()),
-        "benchmark": summarize_results(pd.concat(all_benchmark_returns).sort_index()),
-        "params":    pd.DataFrame(selected_params_history),
+        "strategy": summarize_results(pd.concat(all_returns).sort_index()),
+        "params":   pd.DataFrame(selected_params),
     }
 
 
+# ── Walk-forward (benchmark) ───────────────────────────────────────────────────
+
+# same fold structure as the strategies — computed once, reused for all comparisons
+def run_benchmark_walk_forward(prices, returns, train_window, test_window):
+    all_returns = []
+    n = len(prices)
+    for test_start in range(train_window, n - test_window + 1, test_window):
+        test_end = test_start + test_window
+        _, rets, _ = run_equal_weight_benchmark_block(prices, returns, test_start, test_end)
+        all_returns.append(rets)
+    return summarize_results(pd.concat(all_returns).sort_index())
+
+
 # ── IC analysis ────────────────────────────────────────────────────────────────
-# full-sample: no fitted params → no look-ahead
-# forward_ret at t = returns.shift(-1).loc[t] = r_{t→t+1}
+
+# full-sample, no fitted params → no look-ahead bias here
+# fwd at t = returns.shift(-1).loc[t] = r_{t→t+1}
 def run_ic_analysis(prices, returns, lookback=12):
     fwd = returns.shift(-1)
 
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print("SIGNAL QUALITY  (IC / ICIR)")
-    print("=" * 50)
+    print("=" * 60)
 
-    ic_all = {}
-    for name, fn in SIGNALS:
+    ic_all    = {}
+    decay_all = {}
+
+    for name, fn in SIGNAL_REGISTRY.items():
         ic           = compute_ic(fn(prices, lookback), fwd)
         ic_all[name] = ic
         ic_summary(ic, name)
 
-    print("\n--- IC Decay (cum ret, L=12) ---")
-    decay_all = {}
-    for name, fn in SIGNALS:
-        d = compute_ic_decay(prices, fn, max_horizon=6, lookback=lookback)
+    print("\n--- IC Decay (cumulative return, L=12) ---")
+    for name, fn in SIGNAL_REGISTRY.items():
+        d               = compute_ic_decay(prices, fn, max_horizon=6, lookback=lookback)
         decay_all[name] = d
         print(f"  {name:<22}: " + "  ".join(f"h{h}={v:.3f}" for h, v in d.items()))
 
     return ic_all, decay_all
 
 
+# ── Metrics table ──────────────────────────────────────────────────────────────
+
+def build_metrics_table(results: dict) -> pd.DataFrame:
+    rows = []
+    for name, s in results.items():
+        t, p = s["t_stat"]
+        rows.append({
+            "Ann Ret":  s["ann_ret"],
+            "Ann Vol":  s["ann_vol"],
+            "Sharpe":   s["sharpe"],
+            "Sortino":  s["sortino"],
+            "Calmar":   s["calmar"],
+            "Hit%":     s["hit_rate"] * 100,
+            "Max DD":   s["max_dd"],
+            "t-stat":   t,
+            "p-val":    p,
+        })
+    df = pd.DataFrame(rows, index=pd.Index(list(results.keys()), name="Strategy"))
+    return df.round(4)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
     data    = load_data(tickers, start_date, end_date)
     prices  = get_monthly_prices(data)
     returns = get_monthly_returns(prices)
 
+    # drop leading NaNs — first row is always NaN from pct_change
     returns = returns.dropna()
     prices  = prices.loc[returns.index]
 
-    # 1. signal quality
+    # 1. signal quality — all signals in SIGNAL_REGISTRY, full sample, no params fitted
     ic_all, decay_all = run_ic_analysis(prices, returns)
 
-    # 2. walk-forward
-    signal_types   = ["momentum", "composite"]
-    equal_results  = {}
-    signal_results = {}
+    # 2. benchmark — computed once here, shown alongside all strategies below
+    benchmark = run_benchmark_walk_forward(prices, returns, train_window, test_window)
 
-    for sig in signal_types:
-        for net in net_exposures:
-            equal_results[(sig, net)] = run_walk_forward(
-                prices=prices,
-                returns=returns,
-                lookbacks=lookbacks,
-                quantiles=quantiles,
-                train_window=train_window,
-                test_window=test_window,
-                method="equal",
-                signal_type=sig,
-                target_net_exposure=net,
-                target_gross_exposure=target_gross_exposure,
-            )
+    # 3. walk-forward for every entry in PORTFOLIO_CONFIGS — nothing else
+    results = {}
+    for cfg in PORTFOLIO_CONFIGS:
+        wf = run_walk_forward(
+            prices=prices,
+            returns=returns,
+            lookbacks=lookbacks,
+            quantiles=quantiles,
+            train_window=train_window,
+            test_window=test_window,
+            method=cfg["method"],
+            signal_key=cfg["signal"],
+            target_net_exposure=cfg["net"],
+            target_gross_exposure=target_gross_exposure,
+        )
+        results[cfg["name"]] = wf["strategy"]
 
-            signal_results[(sig, net)] = run_walk_forward(
-                prices=prices,
-                returns=returns,
-                lookbacks=lookbacks,
-                quantiles=quantiles,
-                train_window=train_window,
-                test_window=test_window,
-                method="signal",
-                signal_type=sig,
-                target_net_exposure=net,
-                target_gross_exposure=target_gross_exposure,
-            )
+    results[BENCHMARK_NAME] = benchmark  # append last so it's at the bottom of the table
 
-    benchmark_results = equal_results[("momentum", 1.0)]["benchmark"]
+    # 4. metrics table — same results dict, same order
+    print("\n" + "=" * 60)
+    print("WALK-FORWARD PERFORMANCE SUMMARY")
+    print("=" * 60)
+    tbl = build_metrics_table(results)
+    print(tbl.to_string())
 
-    for (sig, net), results in equal_results.items():
-        print_summary(f"Equal-weighted | Signal={sig} | Net={net}", results["strategy"])
-
-    for (sig, net), results in signal_results.items():
-        print_summary(f"Signal-weighted | Signal={sig} | Net={net}", results["strategy"])
-
-    print_summary("BENCHMARK RESULTS (EQUAL-WEIGHT LONG-ONLY)", benchmark_results)
-
-    # ── Fig 1: IC over time + decay ───────────────────────────────────────
+    # 5. IC analysis plots — same SIGNAL_REGISTRY as step 1
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle("Signal IC Analysis", fontsize=13)
 
@@ -354,9 +365,11 @@ def main():
 
     ax    = axes[1]
     pos   = list(next(iter(decay_all.values())).index)
-    w     = 0.25
+    n_sig = len(decay_all)
+    w     = 0.18
     for i, (name, d) in enumerate(decay_all.items()):
-        ax.bar([p + (i-1)*w for p in pos], d.values, width=w, label=name)
+        offset = (i - (n_sig - 1) / 2) * w  # center bars around each horizon tick
+        ax.bar([p + offset for p in pos], d.values, width=w, label=name)
     ax.axhline(0, color="black", lw=0.8, ls="--")
     ax.set_title("IC Decay  (cum ret, L=12)")
     ax.set_xlabel("horizon (months)")
@@ -365,21 +378,27 @@ def main():
 
     plt.tight_layout(); plt.show()
 
-    # ── Fig 2: cumulative returns ─────────────────────────────────────────
-    plt.figure(figsize=(10, 6))
+    # 6. cumulative returns — same PORTFOLIO_CONFIGS as step 3
+    # split into two panels so each is readable (6 lines + benchmark each)
+    equal_cfgs  = [c for c in PORTFOLIO_CONFIGS if c["method"] == "equal"]
+    signal_cfgs = [c for c in PORTFOLIO_CONFIGS if c["method"] == "signal"]
 
-    for (sig, net), results in signal_results.items():
-        plt.plot(
-            results["strategy"]["cumulative"],
-            label=f"{sig.capitalize()} (equal, net={net})"
-        )
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+    fig.suptitle("Walk-Forward Cumulative Returns", fontsize=13)
 
-    plt.plot(benchmark_results["cumulative"], label="Benchmark (Equal-weight Long-only)")
+    for ax, cfgs, title in [
+        (axes[0], equal_cfgs,  "Equal-Weighted"),
+        (axes[1], signal_cfgs, "Signal-Weighted"),
+    ]:
+        for cfg in cfgs:
+            label = f"{cfg['signal']} | net={cfg['net']}"
+            ax.plot(results[cfg["name"]]["cumulative"], label=label)
+        ax.plot(benchmark["cumulative"], color="black", lw=1.5, ls="--", label=BENCHMARK_NAME)
+        ax.set_title(title)
+        ax.set_ylabel("Cumulative return")
+        ax.legend(fontsize=8); ax.grid(True)
 
-    plt.legend()
-    plt.title("Walk-Forward Strategies by Net Exposure")
-    plt.grid()
-    plt.show()
+    plt.tight_layout(); plt.show()
 
 
 if __name__ == "__main__":

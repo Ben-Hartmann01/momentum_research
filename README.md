@@ -1,198 +1,200 @@
-# Quantitative Momentum Strategy — Walk-Forward Backtesting
+# momentum_research
 
-**Status:** active development — results not production-ready (returns and IC still very weak)
+cross-sectional equity momentum / mean-reversion backtest.
+monthly frequency, walk-forward, IC-weighted signals.
 
----
-
-## Objective
-
-Market-neutral long/short equity strategy based on cross-sectional momentum.
-
-The project implements a walk-forward backtesting framework with signal evaluation, parameter selection, benchmark comparison, transaction costs, and statistical performance metrics.
+**status:** active research — signals still weak and very noisy, not production-ready.
 
 ---
 
-## Signals
+## what it does
 
-The current strategies use cross-sectional momentum and mean-reversion-related momentum signals.
+- computes 4 signals on ~85 US large-caps
+- evaluates signal quality via IC / ICIR / IC decay (full sample, no fitted params)
+- runs 12 portfolio strategies through a walk-forward (36m train → 6m test, rolling)
+- outputs a single metrics table + cumulative return plots for the exact same strategy set
 
-All signals use a skip-1-month structure to reduce microstructure reversal effects.
+---
 
-| Signal | Formula at time t |
+## signals
+
+all signals use skip-1 (`prices.shift(1)`) so signal at `t` never touches `r_t`.
+
+| signal | formula |
 |---|---|
-| Raw Momentum | `P(t-1) / P(t-L) - 1` |
-| Risk-Adjusted Momentum | `μ_L(t) / σ_ann(t-1)` — volatility computed through `t-1` only |
-| Composite | `[z(μ_L) + z(μ_L / σ)] / 2` — cross-sectional z-score before blending |
+| momentum | `P(t-1) / P(t-L) - 1` |
+| risk-adj momentum | `mom_L / σ_ann(t-1)` — σ rolled on lagged returns |
+| mean reversion | `-(P(t-1) / P(t-2) - 1)` — always 1-month reversal |
+| composite | IC-weighted z-score blend of all three above |
+
+### composite signal
+
+three components, each cross-sectionally z-scored.
+weights at `t` = rolling 24m mean absolute IC per component, shifted by 1 period (so no future IC leaks in).
+normalized to sum to 1; equal weights (1/3 each) as fallback until IC history accumulates.
+
+```
+composite(t) = w_mom(t) * z_mom(t) + w_ram(t) * z_ram(t) + w_rev(t) * z_rev(t)
+w_k(t) = |rolling_IC_k(t-1)| / Σ|rolling_IC_j(t-1)|
+```
+
+cross-sectional z-score everywhere — scale differences would otherwise dominate the blend.
 
 ---
 
-## Portfolio Construction
+## registries (central source of truth)
 
-Two portfolio construction approaches are compared.
+two dicts drive everything. no other place controls what runs.
 
-### 1. Equal-Weight Long/Short Strategy
+**`SIGNAL_REGISTRY`** — 4 entries, drives IC analysis only:
 
-1. A signal is computed based on past price performance over a given lookback window.
-2. Assets are ranked according to the signal.
-3. The top quantile is taken long.
-4. The bottom quantile is taken short.
-5. Assets between both quantiles remain neutral.
-6. Positions are equal-weighted within each side.
-7. The portfolio is rebalanced monthly.
+```python
+{
+    "Momentum":       momentum_signal,
+    "Risk-Adj Mom":   risk_adjusted_momentum,
+    "Mean Reversion": lambda p, lb: mean_reversion_signal(p, lookback=1),
+    "Composite":      composite_signal,
+}
+```
 
-Tested exposure settings:
+**`PORTFOLIO_CONFIGS`** — 12 entries, drives walk-forward + metrics table + plots:
 
-- `net = 0`
-- `net = 0.5`
-- `net = 1`
-- `gross = 2`
+```
+Momentum   × {equal, signal-wt} × {L/S, half-L/S, long-only}   →  6 strategies
+Composite  × {equal, signal-wt} × {L/S, half-L/S, long-only}   →  6 strategies
+```
 
-### 2. Signal-Weighted Long/Short Strategy
-
-1. A signal is computed based on past price performance over a given lookback window.
-2. Assets are ranked according to the signal.
-3. The top quantile is taken long.
-4. The bottom quantile is taken short.
-5. Assets between both quantiles remain neutral.
-6. Positions are weighted based on normalized signal strength within each side.
-7. The portfolio is rebalanced monthly.
-
-Weighting rule:
-
-`w_i = s_i / Σs_j`
-
-Fallback:
-
-- If all candidate signals have the wrong sign, the portfolio falls back to equal weights.
-
-Default exposure setting:
-
-- `net = 0`
-- `gross = 2`
+adding a strategy = one row in `PORTFOLIO_CONFIGS`.
+adding a signal to IC analysis = one key in `SIGNAL_REGISTRY`.
 
 ---
 
-## Walk-Forward Backtesting
+## portfolio construction
 
-The backtest avoids look-ahead bias and does not reuse test data for parameter selection.
+both methods rank assets cross-sectionally on the signal and select top/bottom `q` quantile.
 
-Procedure:
+**equal-weight:**
+`w_i = long_target / n_long` (long side), `-short_target / n_short` (short side)
 
-1. Train on a fixed 36-month window.
-2. Run grid search over:
-   - `lookback ∈ {3, 6, 9, 12}`
-   - `q ∈ {0.1, 0.2, 0.3, 0.4, 0.5}`
-3. Select `(L*, q*)` that maximizes in-sample Sharpe.
-4. Test the selected parameters on the next 6 months out-of-sample.
-5. Roll forward by 6 months and repeat.
+**signal-weighted:**
+`w_i ∝ s_i` within the selected quantile — proportional to signal strength.
+fallback to equal weights if all candidates have wrong sign.
+
+exposure arithmetic:
+```
+long_target  = (gross + net) / 2
+short_target = (gross - net) / 2
+gross = 2 always
+```
+
+net exposures tested: `{0.0, 0.5, 1.0}` — market-neutral, half-directional, long-only.
 
 ---
 
-## Signal Quality: IC / ICIR
+## walk-forward
 
-Signal quality is evaluated before backtesting on the full sample.
+```
+train 36m → grid search → test 6m → roll +6m → repeat
+```
 
-Since no parameters are fitted during this step, this does not introduce look-ahead bias.
+grid: `lookback ∈ {3, 6, 9, 12}`, `q ∈ {0.1, 0.2, 0.3, 0.4, 0.5}` → 20 combos per fold.
+param selection: max in-sample Sharpe.
+signal computed on `[0, test_end]` so rolling windows have warmup — only eval window is OOS.
 
-| Metric | Definition |
+---
+
+## signal quality (IC / ICIR)
+
+run on full sample before any fitting — no look-ahead.
+
+| metric | def |
 |---|---|
-| IC | `rank_corr(signal_t, r_{t→t+1})` — Spearman cross-sectional rank correlation |
-| ICIR | `mean(IC) / std(IC)` — Sharpe-like measure of signal quality |
-| IC decay | Evaluated for horizons `h = 1..6m` using `P(t+h) / P(t) - 1` |
+| IC(t) | `spearman_rank_corr(signal_t, r_{t→t+1})` |
+| ICIR | `mean(IC) / std(IC)` — signal Sharpe |
+| IC decay | mean IC at horizons h=1..6m using cumulative return `P(t+h)/P(t) - 1` |
 
-Interpretation:
+rough thresholds: `|mean IC| > 0.05` → live signal, `ICIR > 0.5` → production-grade.
 
-- `|mean IC| > 0.05` may indicate a useful signal
-- `ICIR > 0.5` is considered strong
-
----
-
-## Performance Metrics
-
-| Metric | Definition |
-|---|---|
-| Sharpe | `annualized return / annualized volatility` |
-| Sortino | `annualized return / downside volatility` |
-| Calmar | `annualized return / abs(max drawdown)` |
-| Hit Rate | `P(r_t > 0)` |
-| t-Statistic | Test of `H₀: E[r] = 0`; `|t| > 2` is approximately significant for larger samples |
-| Max Drawdown | `min_t { NAV(t) / max_{s≤t} NAV(s) - 1 }` |
-
-The risk-free rate is assumed to be zero, which is acceptable for a market-neutral strategy prototype.
+all 4 signals evaluated.
 
 ---
 
-## Benchmarks
+## benchmark
 
-### Buy-and-Hold Benchmark
-
-Simple equal-weight buy-and-hold benchmark:
-
-- Every asset receives weight `1 / n`
-- Positions are held until the end of the sample
-- No transaction costs are applied
-
-### Random Long/Short Benchmark
-
-Random long/short portfolio with identical gross and net exposure:
-
-- Selects `n_long + n_short` assets uniformly from the full universe
-- Does not condition on signal values
-- Weights are drawn from `Dirichlet(1)`, equivalent to a uniform distribution on the simplex per side
-- Reuses the same selected `(L*, q*)` as the strategy to isolate weighting skill from parameter selection
+equal-weight long-only across the full universe.
+`w_i = 1/n` per asset at each rebalance.
+transaction costs applied (same 10bps model as strategies).
+computed once via the same fold structure as the walk-forward — not a buy-and-hold series.
 
 ---
 
-## Project Structure
+## performance metrics
 
-`src/`
-- `data_loader.py` — yfinance download and monthly resampling
-- `signals.py` — momentum, risk-adjusted momentum, composite signal
-- `ic_analysis.py` — IC, ICIR, IC decay analysis
-- `portfolio.py` — equal-weight and signal-weighted portfolio construction
-- `backtest.py` — lagged-weight return computation and transaction costs
-- `benchmark.py` — buy-and-hold benchmark
-- `metrics.py` — Sharpe, Sortino, Calmar, hit rate, t-statistic, drawdown
-- `random_portfolio.py` — random long/short benchmark
+output as a single pandas DataFrame table — all 12 strategies + benchmark in one place.
 
-`main.py` — data loading, IC analysis, walk-forward backtest, plots
-
----
-
-## Known Limitations
-
-- Signals are currently weak in both return performance and IC analysis.
-- Volatility weighting may reduce signal quality.
-- Transaction cost model is simplified: flat 10 bps per unit turnover.
-- No market impact or bid-ask spread model is included.
-- Buy-and-hold benchmark is weak for comparison against long/short strategies.
-- Random benchmark currently selects from the full universe instead of only the eligible top/bottom quantiles.
-- Universe consists of roughly 90 current US large-cap stocks, introducing survivorship bias.
-- Signal-weighted momentum can be sensitive to momentum crashes and reversal episodes.
-- Higher net exposure can mechanically improve performance, creating market exposure bias.
+| metric   | def                                  |
+|----------|--------------------------------------|
+| Sharpe   | `ann_ret / ann_vol`, rf = 0          |
+| Sortino  | `ann_ret / σ_downside`               |
+| Calmar   | `ann_ret / abs(max_DD)`              |
+| Hit Rate | `P(r_t > 0)`                         |
+| t-stat   | `H₀: E[r] = 0`, `                    |t| > 2 → p < 0.05` |
+| Max DD   | `min_t(NAV_t / max_{s≤t} NAV_s - 1)` |
 
 ---
 
-## Planned Improvements
+## transaction costs
 
-- Implement r_a_momentum
-- Improve signal design.
-- Add volatility-scaled position sizing.
-- Add walk-forward IC analysis to detect signal decay over time.
-- Restrict random benchmark selection to top/bottom signal quantiles.
-- Improve transaction cost modeling.
-- Add stronger benchmark models.
-- Add additional signals.
-- Improve reporting and visualization.
-- Reduce or eliminate market exposure bias.
-- Clean up plots and output formatting.
+flat 10bps per unit of portfolio turnover:
+```
+cost(t) = 10bps × Σ_i |w_i(t) - w_i(t-1)|
+```
+
+no market impact, no spread model.
 
 ---
 
-## Setup
+## output
 
-Run the following commands:
+1. IC/ICIR/decay table printed to stdout (all 4 signals)
+2. IC time series plot (rolling 12m mean IC) + IC decay bar chart
+3. metrics table (all 12 strategies + benchmark, one DataFrame)
+4. cumulative return plot — 2 panels: equal-weighted strategies | signal-weighted strategies, benchmark in both
 
-`pip install pandas numpy scipy yfinance matplotlib`
+---
 
-`python main.py`
+## known issues
+
+- survivorship bias — universe is ~85 current large-caps, no delisted names
+- signals weak in practice, IC often below threshold
+- vol scaling in risk-adj momentum can suppress signal in high-vol regimes
+- TC model simplified — 10bps flat understates real costs at this turnover
+- random L/S benchmark exists (`src/random_portfolio.py`) but not wired into default run
+- higher net exposure mechanically picks up market beta — not pure signal comparison
+
+---
+
+## structure
+
+```
+src/
+  data_loader.py      yfinance download, monthly resampling
+  signals.py          momentum, risk-adj momentum, mean reversion, composite
+  ic_analysis.py      IC, ICIR, IC decay
+  portfolio.py        equal-weight and signal-weighted construction
+  backtest.py         lagged-weight returns, transaction costs
+  benchmark.py        equal-weight long-only benchmark weights
+  metrics.py          Sharpe, Sortino, Calmar, hit rate, t-stat, drawdown
+  random_portfolio.py random L/S benchmark (available, not in default run)
+
+main.py               data load → IC analysis → walk-forward → table + plots
+```
+
+---
+
+## setup
+
+```
+pip install pandas numpy scipy matplotlib yfinance
+python main.py
+```
